@@ -2,6 +2,8 @@
 
 My [Claude Code subagent](https://docs.claude.com/en/docs/claude-code/sub-agents) definitions. They live in `~/.claude/agents/`.
 
+These are shared as a point of reference, not as drop-in agents. They are written for my own setup. `orchestrator` in particular hands work to my dev boxes (`artoo`, `threepio`) through a `devbox-dispatch` skill that is not included here.
+
 | Agent | What it does |
 |---|---|
 | `orchestrator` | Runs a multi-PR or multi-slice effort: plans, hands each task to an `implementer`, and tracks results from short reports. Launch with `claude --agent orchestrator`. |
