@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# devbox: hand a brief to a coding agent on a Proxmox dev box and follow the job.
+# Runs on the Mac; everything on the box happens over `ssh <box>` as the interactive user.
+# Box layout it keeps (shared with jobs started by hand): ~/handoffs/{briefs,logs,out,jobs}.
+set -euo pipefail
+
+BOXES=(${DEVBOX_BOXES:-artoo threepio})
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=30)
+
+die() { echo "devbox: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  devbox status                         load, free memory, running jobs and repos per box
+  devbox send [options] <brief.md|->    start a job; prints its name and box
+      --name <slug>        job name (default: brief file name); also the worktree name
+      --repo <name>        repo directory on the box (default: this checkout's origin)
+      --url <https-url>    clone URL if the box does not have the repo yet
+      --box <box>          artoo | threepio (default: has the repo, then fewest jobs)
+      --agent <a>          codex (default, sandboxed: edits, cannot commit) | claude (unsandboxed)
+      --base <ref>         start point (default: origin's default branch, freshly fetched)
+      --branch <name>      branch to create (default: agent/<name>)
+      --detach             no branch: detached worktree, for read-only or report jobs
+      --setup '<cmd>'      run in the worktree before the agent, outside its sandbox
+      --effort <level>     codex reasoning effort (default: high)
+      --model <id>         codex model (default: gpt-6.1-sol)
+  devbox list                           every job on every box, newest first
+  devbox wait <name> [--timeout <s>]    block until the job ends, then print its result
+  devbox result <name>                  state, final report, commits and diff stat
+  devbox log <name> [-f] [-n <lines>]   agent log
+  devbox exec <name> -- <cmd...>        run a command in the job's worktree
+  devbox stop <name>                    kill a running job
+EOF
+}
+
+# rrun <box> <script> [args...]: run a script on the box in a login shell (PATH has ~/.local/bin).
+rrun() {
+  local box=$1 script=$2 q="" a
+  shift 2
+  for a in "$@"; do q+=" $(printf %q "$a")"; done
+  "${SSH[@]}" "$box" "bash -ls --$q" <<<"$script"
+}
+
+valid_name() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "bad job name '$1' (lowercase letters, digits, . _ -)"; }
+
+# Shared by the remote scripts: job state from its meta and rc files.
+REMOTE_LIB='
+H=$HOME/handoffs
+job_state() { # <name> -> running | done rc=N | died
+  local pid; pid=$(sed -n "s/^pid=//p" "$H/jobs/$1.meta")
+  if [ -e "$H/jobs/$1.rc" ]; then echo "done rc=$(cat "$H/jobs/$1.rc")"
+  elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo running
+  else echo died; fi
+}
+meta() { sed -n "s/^$2=//p" "$H/jobs/$1.meta"; }
+'
+
+find_box() { # <name> -> box holding the job
+  local b
+  for b in "${BOXES[@]}"; do
+    if "${SSH[@]}" "$b" "test -e ~/handoffs/jobs/$1.meta" 2>/dev/null; then echo "$b"; return; fi
+  done
+  die "no job '$1' on ${BOXES[*]} (jobs started by hand have no record; see: devbox list)"
+}
+
+cmd_status() {
+  local b
+  for b in "${BOXES[@]}"; do
+    echo "== $b"
+    rrun "$b" "$REMOTE_LIB"'
+      echo "load $(cut -d" " -f1-3 /proc/loadavg) | free $(awk "/MemAvailable/{printf \"%.1f\", \$2/1048576}" /proc/meminfo) GiB | agent processes $(pgrep -u "$USER" -fc "codex exec|claude -p" || true)"
+      running=""
+      for m in "$H"/jobs/*.meta; do [ -e "$m" ] || continue; n=$(basename "$m" .meta)
+        [ "$(job_state "$n")" = running ] && running+=" $n"; done
+      echo "running jobs:${running:- none}"
+      echo "repos: $(for d in "$HOME"/*/.git; do [ -d "$d" ] && basename "$(dirname "$d")"; done | tr "\n" " ")"
+    ' || echo "unreachable"
+  done
+}
+
+cmd_list() {
+  local b
+  printf '%-10s %-28s %-7s %-22s %-12s %s\n' BOX JOB AGENT REPO STATE STARTED
+  for b in "${BOXES[@]}"; do
+    rrun "$b" "$REMOTE_LIB"'
+      for m in $(ls -t "$H"/jobs/*.meta 2>/dev/null); do n=$(basename "$m" .meta)
+        printf "%-10s %-28s %-7s %-22s %-12s %s\n" "$1" "$n" "$(meta "$n" agent)" "$(meta "$n" repo)" "$(job_state "$n")" "$(meta "$n" started)"
+      done' "$b" || echo "$b unreachable"
+  done
+}
+
+pick_box() { # <repo> -> reachable box, preferring one that has the repo, then fewest agent processes
+  local b line best="" bestkey=""
+  for b in "${BOXES[@]}"; do
+    line=$("${SSH[@]}" "$b" "test -d ~/$1/.git && h=0 || h=1; echo \$h \$(pgrep -u \$USER -fc 'code[x] exec|claud[e] -p')" 2>/dev/null) || continue
+    if [ -z "$best" ] || [[ "$line" < "$bestkey" ]]; then best=$b bestkey=$line; fi
+  done
+  [ -n "$best" ] || die "no box reachable (${BOXES[*]})"
+  echo "$best"
+}
+
+cmd_send() {
+  local name="" repo="" url="" box="" agent=codex base="" branch="" detach=0 setup="" effort=high model=gpt-6.1-sol brief=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --name) name=$2; shift 2 ;;
+      --repo) repo=$2; shift 2 ;;
+      --url) url=$2; shift 2 ;;
+      --box) box=$2; shift 2 ;;
+      --agent) agent=$2; shift 2 ;;
+      --base) base=$2; shift 2 ;;
+      --branch) branch=$2; shift 2 ;;
+      --detach) detach=1; shift ;;
+      --setup) setup=$2; shift 2 ;;
+      --effort) effort=$2; shift 2 ;;
+      --model) model=$2; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      -) brief=-; shift ;;
+      -*) die "unknown option $1" ;;
+      *) brief=$1; shift ;;
+    esac
+  done
+  [ -n "$brief" ] || die "send needs a brief file (or - for stdin)"
+  [[ $agent == codex || $agent == claude ]] || die "--agent is codex or claude"
+
+  tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+  if [ "$brief" = - ]; then cat > "$tmp"; else [ -r "$brief" ] || die "cannot read $brief"; cat "$brief" > "$tmp"; fi
+  [ -s "$tmp" ] || die "the brief is empty"
+  if [ -z "$name" ]; then
+    [ "$brief" != - ] || die "--name is required when the brief comes from stdin"
+    name=$(basename "$brief" .md)
+  fi
+  valid_name "$name"
+
+  # Default repo and clone URL from the checkout this is run in.
+  local origin=""
+  origin=$(git remote get-url origin 2>/dev/null || true)
+  if [ -z "$repo" ]; then
+    [ -n "$origin" ] || die "not in a git checkout: pass --repo"
+    repo=$(basename "${origin%.git}")
+  fi
+  if [ -z "$url" ] && [ -n "$origin" ] && [ "$(basename "${origin%.git}")" = "$repo" ]; then
+    url=$(sed -E 's#^git@([^:]+):#https://\1/#; s#^ssh://git@#https://#; s#\.git$##' <<<"$origin")
+  fi
+
+  [ -n "$box" ] || box=$(pick_box "$repo")
+  [ -n "$branch" ] || branch="agent/$name"
+
+  "${SSH[@]}" "$box" "mkdir -p ~/handoffs/.incoming && cat > ~/handoffs/.incoming/$name.md" < "$tmp"
+  rrun "$box" "$REMOTE_LIB"'
+    set -euo pipefail
+    name=$1 repo=$2 url=$3 agent=$4 base=$5 branch=$6 detach=$7 effort=$8 setup=$(printf %s "$9" | base64 -d) model=${10}
+    mkdir -p "$H"/{briefs,logs,out,jobs}
+    wt=$HOME/$repo/.claude/worktrees/$name
+    fail() { rm -f "$H/.incoming/$name.md"; echo "devbox: $*" >&2; exit 3; }
+    for p in "$H/jobs/$name.meta" "$H/briefs/$name.md" "$H/out/$name.md" "$wt"; do
+      [ ! -e "$p" ] || fail "name \"$name\" is taken on $(hostname) ($p exists): choose another --name"
+    done
+    if [ ! -d "$HOME/$repo/.git" ]; then
+      [ -n "$url" ] || fail "$(hostname) has no ~/$repo: pass --url to clone it"
+      git clone --quiet "$url" "$HOME/$repo" || fail "clone of $url failed"
+    fi
+    cd "$HOME/$repo"
+    git fetch --quiet origin || fail "git fetch failed in ~/$repo"
+    if [ -z "$base" ]; then
+      base=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD || echo origin/main)
+    fi
+    if [ "$detach" = 1 ]; then branch="(detached)"; git worktree add --quiet --detach "$wt" "$base" || fail "worktree add failed"
+    else git worktree add --quiet -b "$branch" "$wt" "$base" || fail "worktree add failed (does branch $branch exist?)"; fi
+    mv "$H/.incoming/$name.md" "$H/briefs/$name.md"
+
+    case $agent in
+      codex) run="codex exec -s workspace-write -m $model -c model_reasoning_effort=$effort -o \"$H/out/$name.md\" - < \"$H/briefs/$name.md\" > \"$H/logs/$name.log\" 2>&1" ;;
+      claude) run="claude -p --permission-mode bypassPermissions --disallowedTools \"Bash(git push:*)\" < \"$H/briefs/$name.md\" > \"$H/out/$name.md\" 2> \"$H/logs/$name.log\"" ;;
+    esac
+    {
+      echo "cd \"$wt\" || { echo 97 > \"$H/jobs/$name.rc\"; exit 97; }"
+      if [ -n "$setup" ]; then
+        echo "if ! ( $setup ) > \"$H/logs/$name.setup.log\" 2>&1; then echo 98 > \"$H/jobs/$name.rc\"; exit 98; fi"
+      fi
+      echo "$run"
+      echo "echo \$? > \"$H/jobs/$name.rc\""
+    } > "$H/jobs/$name.sh"
+    setsid nohup bash -l "$H/jobs/$name.sh" > /dev/null 2>&1 < /dev/null &
+    printf "pid=%s\nrepo=%s\nworktree=%s\nbranch=%s\nbase=%s\nbase_sha=%s\nagent=%s\nstarted=%s\n" \
+      "$!" "$repo" "$wt" "$branch" "$base" "$(git rev-parse "$base")" "$agent" "$(date -u +%Y-%m-%dT%H:%MZ)" > "$H/jobs/$name.meta"
+    echo "started $name on $(hostname): $agent in $wt ($branch from $base)"
+  ' "$name" "$repo" "$url" "$agent" "$base" "$branch" "$detach" "$effort" "$(printf %s "$setup" | base64 | tr -d '\n')" "$model"
+  echo "follow: devbox wait $name   |   devbox log $name -f   |   devbox result $name"
+}
+
+RESULT_SCRIPT="$REMOTE_LIB"'
+  name=$1; wt=$(meta "$name" worktree); sha=$(meta "$name" base_sha)
+  echo "job $name on $(hostname): $(job_state "$name") | $(meta "$name" agent) | $(meta "$name" repo) | branch $(meta "$name" branch) | started $(meta "$name" started)"
+  echo "worktree: $wt"
+  if [ "$(cat "$H/jobs/$name.rc" 2>/dev/null)" = 98 ]; then echo "--- setup failed:"; tail -n 30 "$H/logs/$name.setup.log"; fi
+  echo "--- final report ($H/out/$name.md)"
+  if [ -s "$H/out/$name.md" ]; then cat "$H/out/$name.md"; echo; else echo "(none yet; last log lines follow)"; tail -n 15 "$H/logs/$name.log" 2>/dev/null; fi
+  if [ -d "$wt" ]; then
+    echo "--- commits since $(meta "$name" base)"; git -C "$wt" log --oneline "$sha"..HEAD
+    echo "--- changes since base (committed and not)"; git -C "$wt" diff --stat "$sha"
+    echo "--- uncommitted"; git -C "$wt" status --short
+  fi
+'
+
+cmd_result() { local box; valid_name "$1"; box=$(find_box "$1"); rrun "$box" "$RESULT_SCRIPT" "$1"; }
+
+cmd_wait() {
+  local name=$1 timeout=0 box
+  shift; [ "${1:-}" = --timeout ] && timeout=$2
+  valid_name "$name"; box=$(find_box "$name")
+  rrun "$box" "$REMOTE_LIB"'
+    t=0
+    while [ "$(job_state "$1")" = running ]; do
+      sleep 10; t=$((t+10))
+      if [ "$2" -gt 0 ] && [ "$t" -ge "$2" ]; then echo "still running after $2 s"; exit 4; fi
+    done' "$name" "$timeout" || { [ $? -eq 4 ] && exit 4; die "lost the connection to $box; run wait again"; }
+  rrun "$box" "$RESULT_SCRIPT" "$name"
+}
+
+cmd_log() {
+  local name=$1 follow="" n=40 box
+  shift
+  while [ $# -gt 0 ]; do case $1 in -f) follow=-f; shift ;; -n) n=$2; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  valid_name "$name"; box=$(find_box "$name")
+  "${SSH[@]}" "$box" "tail -n $((n)) $follow ~/handoffs/logs/$name.log"
+}
+
+cmd_exec() {
+  local name=$1 box; shift
+  [ "${1:-}" = -- ] && shift
+  [ $# -gt 0 ] || die "exec needs a command"
+  valid_name "$name"; box=$(find_box "$name")
+  rrun "$box" "$REMOTE_LIB"'n=$1; shift; cd "$(meta "$n" worktree)" && "$@"' "$name" "$@"
+}
+
+cmd_stop() {
+  local box; valid_name "$1"; box=$(find_box "$1")
+  rrun "$box" "$REMOTE_LIB"'
+    if [ "$(job_state "$1")" != running ]; then echo "$1 is not running: $(job_state "$1")"; exit 0; fi
+    pid=$(meta "$1" pid); kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
+    echo 143 > "$H/jobs/$1.rc"; echo "stopped $1 (worktree and branch kept)"' "$1"
+}
+
+[ $# -gt 0 ] || { usage; exit 1; }
+sub=$1; shift
+case $sub in
+  status) cmd_status ;;
+  send) cmd_send "$@" ;;
+  list) cmd_list ;;
+  wait) [ $# -ge 1 ] || die "wait needs a job name"; cmd_wait "$@" ;;
+  result) [ $# -eq 1 ] || die "result needs a job name"; cmd_result "$1" ;;
+  log) [ $# -ge 1 ] || die "log needs a job name"; cmd_log "$@" ;;
+  exec) [ $# -ge 2 ] || die "exec needs a job name and a command"; cmd_exec "$@" ;;
+  stop) [ $# -eq 1 ] || die "stop needs a job name"; cmd_stop "$1" ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

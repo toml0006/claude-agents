@@ -1,8 +1,10 @@
 # claude-agents
 
-My [Claude Code subagent](https://docs.claude.com/en/docs/claude-code/sub-agents) definitions. They live in `~/.claude/agents/`.
+My [Claude Code subagent](https://docs.claude.com/en/docs/claude-code/sub-agents) definitions, plus the `devbox-dispatch` skill the orchestrator uses to hand work to my dev boxes.
 
-These are shared as a point of reference, not as drop-in agents. They are written for my own setup. `orchestrator` in particular hands work to my dev boxes (`artoo`, `threepio`) through a `devbox-dispatch` skill that is not included here.
+These are shared as a point of reference, not as drop-in agents. They are written for my own setup: `orchestrator` hands work to two dev boxes (`artoo`, `threepio`) through `devbox-dispatch`, and that skill assumes those boxes exist and are reachable over SSH.
+
+## Agents
 
 | Agent | What it does |
 |---|---|
@@ -14,8 +16,18 @@ These are shared as a point of reference, not as drop-in agents. They are writte
 
 The `codebase-memory*` agents need the `codebase-memory-mcp` server and its `codebase-memory` skill.
 
+## Skills
+
+| Skill | What it does |
+|---|---|
+| [`devbox-dispatch`](skills/devbox-dispatch/SKILL.md) | Writes a brief, starts a headless Codex or Claude Code run in a fresh git worktree on a dev box, and collects the report and diff later. All of it goes through one script, [`scripts/devbox`](skills/devbox-dispatch/scripts/devbox). |
+
 ## Install
 
+Claude Code reads every `.md` file under `~/.claude/agents`, including subfolders, so link only the `agents` folder there:
+
 ```sh
-git clone https://github.com/toml0006/claude-agents.git ~/.claude/agents
+git clone https://github.com/toml0006/claude-agents.git ~/dev/claude-agents
+ln -s ~/dev/claude-agents/agents ~/.claude/agents
+ln -s ~/dev/claude-agents/skills/devbox-dispatch ~/.claude/skills/devbox-dispatch
 ```
